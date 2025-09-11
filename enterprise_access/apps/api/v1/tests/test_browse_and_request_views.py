@@ -31,7 +31,10 @@ from enterprise_access.apps.subsidy_access_policy.constants import (
     REASON_POLICY_SPEND_LIMIT_REACHED,
     REASON_SUBSIDY_EXPIRED
 )
-from enterprise_access.apps.subsidy_access_policy.exceptions import SubsidyAccessPolicyLockAttemptFailed
+from enterprise_access.apps.subsidy_access_policy.exceptions import (
+    SubisidyAccessPolicyRequestApprovalError,
+    SubsidyAccessPolicyLockAttemptFailed
+)
 from enterprise_access.apps.subsidy_access_policy.models import SubsidyAccessPolicy
 from enterprise_access.apps.subsidy_access_policy.tests.factories import (
     PerLearnerSpendCapLearnerCreditAccessPolicyFactory
@@ -2879,6 +2882,94 @@ class TestLearnerCreditRequestViewSet(BaseEnterpriseAccessTestCase):
         ).first()
         assert success_action is not None
 
+    @mock.patch(
+        "enterprise_access.apps.api.v1.views.browse_and_request.approve_learner_credit_request_via_policy"
+    )
+    def test_bulk_approve_mixed_success(self, mock_approve):
+        """
+        Test bulk approve returns partial success without failing the whole request.
+        """
+        # Set admin context for the correct enterprise
+        self.set_jwt_cookie(
+            [
+                {
+                    "system_wide_role": SYSTEM_ENTERPRISE_ADMIN_ROLE,
+                    "context": str(self.enterprise_customer_uuid_1),
+                }
+            ]
+        )
+
+        # One request will approve, one will fail, one skipped
+        requested_ok = self.user_request_1  # requested, will approve
+        requested_fail = LearnerCreditRequestFactory(
+            enterprise_customer_uuid=self.enterprise_customer_uuid_1,
+            user=self.user,
+            learner_credit_request_config=self.learner_credit_config,
+            course_price=1200,
+            state=SubsidyRequestStates.REQUESTED,
+            assignment=None,
+        )
+        skipped_req = LearnerCreditRequestFactory(
+            enterprise_customer_uuid=self.enterprise_customer_uuid_1,
+            learner_credit_request_config=self.learner_credit_config,
+            state=SubsidyRequestStates.APPROVED,
+        )
+
+        # Configure approve side effects
+        def approve_side_effect(
+            _policy_uuid,
+            content_key,
+            content_price_cents,
+            learner_email,
+            lms_user_id,
+        ):
+            if (str(requested_fail.user.lms_user_id) == str(lms_user_id) and
+                    content_price_cents == requested_fail.course_price):
+                raise SubisidyAccessPolicyRequestApprovalError(
+                    "policy validation failed", 422
+                )
+            # Return a basic assignment via factory
+            return LearnerContentAssignmentFactory(
+                assignment_configuration=self.assignment_config,
+                learner_email=learner_email,
+                lms_user_id=lms_user_id,
+                content_key=content_key,
+                content_quantity=-abs(content_price_cents),
+                state="allocated",
+            )
+
+        mock_approve.side_effect = approve_side_effect
+
+        url = reverse("api:v1:learner-credit-requests-bulk-approve")
+        payload = {
+            "enterprise_customer_uuid": str(self.enterprise_customer_uuid_1),
+            "policy_uuid": str(self.policy.uuid),
+            "subsidy_request_uuids": [
+                str(requested_ok.uuid),
+                str(requested_fail.uuid),
+                str(skipped_req.uuid),
+                str(uuid4()),  # not found
+            ],
+        }
+        response = self.client.post(url, payload)
+        assert response.status_code == status.HTTP_200_OK
+
+        data = response.json()
+        assert len(data["approved"]) == 1
+        assert len(data["failed"]) == 1
+        assert len(data["skipped"]) == 1
+
+        requested_ok.refresh_from_db()
+        requested_fail.refresh_from_db()
+        skipped_req.refresh_from_db()
+
+        assert requested_ok.state == SubsidyRequestStates.APPROVED
+        assert requested_fail.state in [
+            SubsidyRequestStates.REQUESTED,
+            SubsidyRequestStates.ERROR,
+        ]
+        assert skipped_req.state == SubsidyRequestStates.APPROVED
+
     @mock.patch('enterprise_access.apps.content_assignments.api.cancel_assignments')
     def test_cancel_failed_assignment_cancellation(self, mock_cancel_assignments):
         """
@@ -3171,3 +3262,167 @@ class TestLearnerCreditRequestViewSet(BaseEnterpriseAccessTestCase):
         else:
             self.assertGreater(first_learner_credit_request_position, second_learner_credit_request_position,
                                "'approved' action type should sort after 'requested' in descending order")
+
+    @mock.patch(
+        "enterprise_access.apps.api.v1.views.browse_and_request.approve_learner_credit_request_via_policy"
+    )
+    def test_bulk_approve_all_happy_path(self, mock_approve):
+        """
+        Test successful bulk approve with approve_all=True for all pending learner credit requests.
+        """
+        # Clear other requests that may interfere with this test
+        LearnerCreditRequest.objects.exclude(uuid=self.user_request_1.uuid).delete()
+
+        # Set up the initial request state
+        self.user_request_1.state = SubsidyRequestStates.REQUESTED
+        self.user_request_1.assignment = None
+        self.user_request_1.save()
+
+        # Create additional pending request for approve-all
+        request_2 = LearnerCreditRequestFactory(
+            course_id='course-v1:edX+Test2+2024',
+            enterprise_customer_uuid=self.enterprise_customer_uuid_1,
+            learner_credit_request_config=self.learner_credit_config,
+            course_price=500,
+            state=SubsidyRequestStates.REQUESTED,
+            assignment=None
+        )
+
+        # Configure approve to return assignments for each request
+        def approve_side_effect(policy_uuid, content_key, content_price_cents, learner_email, lms_user_id):
+            return LearnerContentAssignmentFactory(
+                assignment_configuration=self.assignment_config,
+                learner_email=learner_email,
+                lms_user_id=lms_user_id,
+                content_key=content_key,
+                content_quantity=-abs(content_price_cents),
+                state="allocated",
+            )
+
+        mock_approve.side_effect = approve_side_effect
+
+        self.set_jwt_cookie([{
+            'system_wide_role': SYSTEM_ENTERPRISE_ADMIN_ROLE,
+            'context': str(self.enterprise_customer_uuid_1)
+        }])
+
+        url = reverse('api:v1:learner-credit-requests-bulk-approve')
+        data = {
+            "enterprise_customer_uuid": str(self.enterprise_customer_uuid_1),
+            "policy_uuid": str(self.policy.uuid),
+            "approve_all": True,
+        }
+        response = self.client.post(url, data)
+        assert response.status_code == status.HTTP_200_OK
+
+        # Verify both requests were approved
+        assert len(response.data.get('approved', [])) == 2
+        self.user_request_1.refresh_from_db()
+        request_2.refresh_from_db()
+        assert self.user_request_1.state == SubsidyRequestStates.APPROVED
+        assert request_2.state == SubsidyRequestStates.APPROVED
+        assert self.user_request_1.assignment is not None
+        assert request_2.assignment is not None
+
+    @mock.patch('enterprise_access.apps.api.v1.views.browse_and_request.get_enterprise_uuid_from_request_data')
+    def test_bulk_approve_all_no_requests_found(self, mock_get_enterprise_uuid):
+        """
+        Test bulk approve with approve_all=True returns empty results when no approvable requests exist.
+        """
+        mock_get_enterprise_uuid.return_value = str(self.enterprise_customer_uuid_1)
+
+        # Set all requests to non-approvable states
+        LearnerCreditRequest.objects.filter(
+            learner_credit_request_config=self.learner_credit_config
+        ).update(state=SubsidyRequestStates.DECLINED)
+
+        self.set_jwt_cookie([{
+            'system_wide_role': SYSTEM_ENTERPRISE_ADMIN_ROLE,
+            'context': str(self.enterprise_customer_uuid_1)
+        }])
+
+        url = reverse('api:v1:learner-credit-requests-bulk-approve')
+        data = {
+            "enterprise_customer_uuid": str(self.enterprise_customer_uuid_1),
+            "policy_uuid": str(self.policy.uuid),
+            "approve_all": True,
+        }
+        response = self.client.post(url, data)
+        # When no requests match, the endpoint returns 200 with empty approved list
+        assert response.status_code == status.HTTP_200_OK
+        assert len(response.data.get('approved', [])) == 0
+
+    def test_bulk_approve_missing_policy_uuid(self):
+        """
+        Test bulk approve returns 400 when policy_uuid is missing.
+        """
+        self.set_jwt_cookie([{
+            'system_wide_role': SYSTEM_ENTERPRISE_ADMIN_ROLE,
+            'context': str(self.enterprise_customer_uuid_1)
+        }])
+
+        url = reverse('api:v1:learner-credit-requests-bulk-approve')
+        data = {
+            "enterprise_customer_uuid": str(self.enterprise_customer_uuid_1),
+            "approve_all": True,
+        }
+        response = self.client.post(url, data)
+        assert response.status_code == status.HTTP_400_BAD_REQUEST
+        assert 'policy_uuid' in response.data
+
+    def test_bulk_approve_unauthorized_access(self):
+        """
+        Test bulk approve without proper admin permissions returns 403.
+        """
+        # Set learner role instead of admin
+        self.set_jwt_cookie([{
+            'system_wide_role': SYSTEM_ENTERPRISE_LEARNER_ROLE,
+            'context': str(self.enterprise_customer_uuid_1)
+        }])
+
+        url = reverse('api:v1:learner-credit-requests-bulk-approve')
+        data = {
+            "enterprise_customer_uuid": str(self.enterprise_customer_uuid_1),
+            "policy_uuid": str(self.policy.uuid),
+            "approve_all": True,
+        }
+        response = self.client.post(url, data)
+        assert response.status_code == status.HTTP_403_FORBIDDEN
+
+    @mock.patch(
+        "enterprise_access.apps.api.v1.views.browse_and_request.approve_learner_credit_request_via_policy"
+    )
+    def test_bulk_approve_all_policy_expired(self, mock_approve):
+        """
+        Test bulk approve with approve_all=True when policy is expired/inactive.
+        """
+        # Clear other requests that may interfere with this test
+        LearnerCreditRequest.objects.exclude(uuid=self.user_request_1.uuid).delete()
+
+        # Set up the initial request state
+        self.user_request_1.state = SubsidyRequestStates.REQUESTED
+        self.user_request_1.assignment = None
+        self.user_request_1.save()
+
+        # Configure approve to raise an error for inactive policy
+        mock_approve.side_effect = SubisidyAccessPolicyRequestApprovalError(
+            "Policy is not active", 422
+        )
+
+        self.set_jwt_cookie([{
+            'system_wide_role': SYSTEM_ENTERPRISE_ADMIN_ROLE,
+            'context': str(self.enterprise_customer_uuid_1)
+        }])
+
+        url = reverse('api:v1:learner-credit-requests-bulk-approve')
+        data = {
+            "enterprise_customer_uuid": str(self.enterprise_customer_uuid_1),
+            "policy_uuid": str(self.policy.uuid),
+            "approve_all": True,
+        }
+        response = self.client.post(url, data)
+        # When policy is inactive, requests fail with appropriate error in failed list
+        assert response.status_code == status.HTTP_200_OK
+        # Verify all requests are in the failed list
+        assert len(response.data.get('failed', [])) > 0
+        assert len(response.data.get('approved', [])) == 0
